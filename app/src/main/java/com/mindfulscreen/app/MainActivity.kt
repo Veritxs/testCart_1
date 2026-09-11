@@ -42,7 +42,7 @@ class MainActivity : ComponentActivity() {
         maybeRequestNotificationPermission()
         setContent {
             MindfulScreenTheme {
-                MindfulScreenApp()
+                MindfulScreenAppRoot()
             }
         }
     }
@@ -61,7 +61,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun MindfulScreenApp() {
+private fun MindfulScreenAppRoot() {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
