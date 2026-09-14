@@ -59,21 +59,26 @@ class UsageStatsRepository(private val context: Context) {
             val now = System.currentTimeMillis()
             val end = minOf(endOfDay, now)
 
-            // Authoritative per-app foreground time from the OS.
-            val foregroundByPkg = queryDailyForegroundMs(start, end)
-            // Supplementary signals (opens + late-night split) from event replay.
+            // Two independent measurements, each with different blind spots:
+            //  - OS daily aggregate: reliable historically, but LAGS for the current day
+            //    on Samsung/One UI (updates are batched), so it under-reports "today".
+            //  - Event replay: fresh/near-real-time, but can miss time if events drop.
+            // Taking the MAX per app gives the most accurate figure and matches the
+            // phone's Digital Wellbeing far more closely on Samsung devices.
+            val aggregateByPkg = queryDailyForegroundMs(start, end)
             val replay = queryForegroundTime(start, end, zone)
 
-            val perApp = foregroundByPkg
-                .filter { (_, ms) -> ms > 0 }
-                .map { (pkg, ms) ->
-                    AppUsage(
-                        packageName = pkg,
-                        label = labelFor(pkg),
-                        timeMs = ms,
-                        opens = replay[pkg]?.opens ?: 0,
-                    )
-                }
+            val allPkgs = aggregateByPkg.keys + replay.keys
+            val perApp = allPkgs.mapNotNull { pkg ->
+                val ms = maxOf(aggregateByPkg[pkg] ?: 0L, replay[pkg]?.timeMs ?: 0L)
+                if (ms <= 0L) null
+                else AppUsage(
+                    packageName = pkg,
+                    label = labelFor(pkg),
+                    timeMs = ms,
+                    opens = replay[pkg]?.opens ?: 0,
+                )
+            }
             val total = perApp.sumOf { it.timeMs }
             val lateNight = replay.values.sumOf { it.lateNightMs }
 
@@ -210,9 +215,10 @@ class UsageStatsRepository(private val context: Context) {
         /**
          * Maximum credited length of a single uninterrupted foreground session.
          * A dropped "stop"/screen-off event can otherwise leave a session open for
-         * hours; capping it prevents phantom usage like "Gojek 4h" from a stray event.
-         * 30 minutes comfortably covers a normal continuous session.
+         * hours (the old "Gojek 4h" phantom). Set to 2 hours so genuinely long
+         * continuous sessions (e.g. gaming) are not truncated, while still capping
+         * runaway sessions caused by missing events.
          */
-        private const val MAX_SESSION_MS = 30 * 60 * 1000L
+        private const val MAX_SESSION_MS = 2 * 60 * 60 * 1000L
     }
 }
