@@ -5,6 +5,7 @@ import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Process
 import android.provider.Settings
 import com.mindfulscreen.app.data.model.AppUsage
@@ -12,7 +13,6 @@ import com.mindfulscreen.app.data.model.DayUsage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
-import java.time.LocalDateTime
 import java.time.ZoneId
 
 /**
@@ -20,6 +20,14 @@ import java.time.ZoneId
  *
  * Requires the special "Usage Access" permission (PACKAGE_USAGE_STATS), which the
  * user grants in system Settings — see [hasUsageAccess] / [usageAccessSettingsIntent].
+ *
+ * Design note (accuracy): we use [UsageStatsManager.queryAndAggregateUsageStats] as the
+ * single source of truth for per-app time. It merges the OS usage buckets for the day
+ * and keys them by package — the same underlying data the system "Digital Wellbeing"
+ * screen shows. Earlier versions reconstructed time from raw foreground/background
+ * events, but on some OEM builds (notably Samsung/One UI) those events are batched or
+ * dropped, which produced both phantom usage and under-counting. The aggregate API is
+ * far more reliable across devices.
  */
 class UsageStatsRepository(private val context: Context) {
 
@@ -42,15 +50,7 @@ class UsageStatsRepository(private val context: Context) {
     fun usageAccessSettingsIntent(): Intent =
         Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
 
-    /**
-     * Aggregated usage for [date] (defaults to today).
-     *
-     * Per-app foreground time comes from Android's authoritative
-     * [UsageStatsManager.queryUsageStats] with INTERVAL_DAILY — the same source the
-     * system "Digital Wellbeing" screen uses, so our numbers match the phone's own.
-     * Event replay is used only for supplementary signals the aggregate can't give us:
-     * open counts and the late-night (00:00–06:00) portion.
-     */
+    /** Aggregated usage for [date] (defaults to today). */
     suspend fun getDayUsage(date: LocalDate = LocalDate.now()): DayUsage =
         withContext(Dispatchers.IO) {
             val zone = ZoneId.systemDefault()
@@ -59,141 +59,89 @@ class UsageStatsRepository(private val context: Context) {
             val now = System.currentTimeMillis()
             val end = minOf(endOfDay, now)
 
-            // Two independent measurements, each with different blind spots:
-            //  - OS daily aggregate: reliable historically, but LAGS for the current day
-            //    on Samsung/One UI (updates are batched), so it under-reports "today".
-            //  - Event replay: fresh/near-real-time, but can miss time if events drop.
-            // Taking the MAX per app gives the most accurate figure and matches the
-            // phone's Digital Wellbeing far more closely on Samsung devices.
-            val aggregateByPkg = queryDailyForegroundMs(start, end)
-            val replay = queryForegroundTime(start, end, zone)
-
-            val allPkgs = aggregateByPkg.keys + replay.keys
-            val perApp = allPkgs.mapNotNull { pkg ->
-                val ms = maxOf(aggregateByPkg[pkg] ?: 0L, replay[pkg]?.timeMs ?: 0L)
-                if (ms <= 0L) null
-                else AppUsage(
-                    packageName = pkg,
-                    label = labelFor(pkg),
-                    timeMs = ms,
-                    opens = replay[pkg]?.opens ?: 0,
-                )
-            }
+            val perApp = queryAggregatedUsage(start, end)
             val total = perApp.sumOf { it.timeMs }
-            val lateNight = replay.values.sumOf { it.lateNightMs }
 
             DayUsage(
                 dateEpochDay = date.toEpochDay(),
                 totalMs = total,
-                perApp = perApp,
-                lateNightMs = lateNight,
+                perApp = perApp.sortedByDescending { it.timeMs },
+                lateNightMs = queryLateNightMs(start, end, zone),
             )
         }
 
     /**
-     * Per-app foreground milliseconds for [start,end] using the OS daily aggregates.
-     * Because INTERVAL_DAILY buckets can overlap the requested window, we take the max
-     * reported foreground time per package rather than summing (summing double-counts).
+     * Per-app foreground time for [start,end] from the OS aggregate.
+     *
+     * We report the larger of [android.app.usage.UsageStats.getTotalTimeInForeground]
+     * and, where available (API 29+), the "visible" time — Digital Wellbeing counts the
+     * time an app is visible on screen, which for some apps exceeds strict foreground
+     * time. Taking the max brings our numbers in line with the system figure.
      */
-    private fun queryDailyForegroundMs(start: Long, end: Long): Map<String, Long> {
-        val stats = usageStatsManager.queryUsageStats(
-            UsageStatsManager.INTERVAL_DAILY, start, end
-        ) ?: return emptyMap()
-        val result = HashMap<String, Long>()
-        for (s in stats) {
-            val fg = s.totalTimeInForeground
-            if (fg <= 0) continue
-            val prev = result[s.packageName] ?: 0L
-            if (fg > prev) result[s.packageName] = fg
+    private fun queryAggregatedUsage(start: Long, end: Long): List<AppUsage> {
+        val map = usageStatsManager.queryAndAggregateUsageStats(start, end)
+        if (map.isEmpty()) return emptyList()
+
+        val myPackage = context.packageName
+        return map.values.mapNotNull { stats ->
+            var ms = stats.totalTimeInForeground
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ms = maxOf(ms, stats.totalTimeVisible)
+            }
+            val pkg = stats.packageName
+            when {
+                ms <= 0L -> null
+                pkg == myPackage -> null            // don't report ourselves
+                !isLaunchable(pkg) -> null          // skip system/background-only packages
+                else -> AppUsage(pkg, labelFor(pkg), ms, opens = 0)
+            }
         }
-        return result
     }
 
     /**
-     * Reconstructs per-app foreground time by replaying usage events.
-     *
-     * Key correctness rules (fixing earlier over-counting):
-     *  - Only ONE app is in the foreground at a time. When a new app comes to the
-     *    foreground, the previously-foreground app's session is closed. We never rely
-     *    solely on per-app resume/pause pairing, because those events are frequently
-     *    dropped and leave sessions open for hours.
-     *  - We prefer the modern ACTIVITY_RESUMED/PAUSED events and ignore the legacy
-     *    MOVE_TO_FOREGROUND/BACKGROUND duplicates so a single session isn't double-opened.
-     *  - Any single session is capped (a dropped "stop" event can't inflate to hours).
+     * Milliseconds of usage that fell between 00:00–06:00 for the day, derived from
+     * events. This is a supplementary signal only (a highlight on the Insights screen),
+     * so any small event inaccuracy here never affects the per-app totals above.
      */
-    private fun queryForegroundTime(
-        start: Long,
-        end: Long,
-        zone: ZoneId,
-    ): Map<String, MutableAppAccum> {
-        val result = HashMap<String, MutableAppAccum>()
-        val events = usageStatsManager.queryEvents(start, end)
+    private fun queryLateNightMs(start: Long, end: Long, zone: ZoneId): Long {
+        val nightEnd = minOf(
+            end,
+            LocalDate.now(zone).atTime(6, 0).atZone(zone).toInstant().toEpochMilli()
+        )
+        if (nightEnd <= start) return 0L
+
+        val events = usageStatsManager.queryEvents(start, nightEnd)
         val event = android.app.usage.UsageEvents.Event()
-
-        // The single app currently in the foreground, and since when.
-        var currentPkg: String? = null
-        var currentSince: Long = 0L
-
-        fun closeCurrent(at: Long) {
-            val pkg = currentPkg ?: return
-            accumulate(result, pkg, currentSince, at, zone)
-            currentPkg = null
-        }
-
+        var currentSince = -1L
+        var total = 0L
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
-            val pkg = event.packageName ?: continue
             when (event.eventType) {
-                // App comes to the foreground: close whoever was there, open this one.
                 android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED -> {
-                    if (pkg != currentPkg) {
-                        // Cap the outgoing session in case its stop event was dropped.
-                        closeCurrent(event.timeStamp)
-                        currentPkg = pkg
-                        currentSince = event.timeStamp
-                        result.getOrPut(pkg) { MutableAppAccum(pkg) }.opens++
-                    }
+                    if (currentSince < 0) currentSince = event.timeStamp
                 }
-                // This app left the foreground: close its session if it was the active one.
-                android.app.usage.UsageEvents.Event.ACTIVITY_PAUSED -> {
-                    if (pkg == currentPkg) closeCurrent(event.timeStamp)
-                }
-                // Screen turned off / became non-interactive: nothing is in the foreground.
+                android.app.usage.UsageEvents.Event.ACTIVITY_PAUSED,
                 android.app.usage.UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
-                    closeCurrent(event.timeStamp)
+                    if (currentSince >= 0) {
+                        total += (event.timeStamp - currentSince).coerceIn(0, MAX_SESSION_MS)
+                        currentSince = -1L
+                    }
                 }
             }
         }
-        // Close whatever was still open (accumulate() caps runaway sessions).
-        currentPkg?.let { accumulate(result, it, currentSince, end, zone) }
-        return result
+        if (currentSince >= 0) {
+            total += (nightEnd - currentSince).coerceIn(0, MAX_SESSION_MS)
+        }
+        return total
     }
 
-    private fun accumulate(
-        map: MutableMap<String, MutableAppAccum>,
-        pkg: String,
-        from: Long,
-        rawTo: Long,
-        zone: ZoneId,
-    ) {
-        if (rawTo <= from) return
-        // Guard against dropped "stop" events inflating a single session to hours.
-        val to = minOf(rawTo, from + MAX_SESSION_MS)
-        val accum = map.getOrPut(pkg) { MutableAppAccum(pkg) }
-        accum.timeMs += (to - from)
-        accum.lateNightMs += lateNightOverlap(from, to, zone)
-    }
+    /** True if the package has a launcher entry (i.e. a user-facing app). */
+    private fun isLaunchable(pkg: String): Boolean =
+        launchableCache.getOrPut(pkg) {
+            packageManager.getLaunchIntentForPackage(pkg) != null
+        }
 
-    /** Milliseconds of [from,to] that fall between 00:00–06:00 local (late-night usage). */
-    private fun lateNightOverlap(from: Long, to: Long, zone: ZoneId): Long {
-        val day = LocalDateTime.ofEpochSecond(from / 1000, 0,
-            zone.rules.getOffset(java.time.Instant.ofEpochMilli(from))).toLocalDate()
-        val nightStart = day.atStartOfDay(zone).toInstant().toEpochMilli()
-        val nightEnd = day.atTime(6, 0).atZone(zone).toInstant().toEpochMilli()
-        val lo = maxOf(from, nightStart)
-        val hi = minOf(to, nightEnd)
-        return if (hi > lo) hi - lo else 0L
-    }
+    private val launchableCache = HashMap<String, Boolean>()
 
     private val labelCache = HashMap<String, String>()
     private fun labelFor(pkg: String): String = labelCache.getOrPut(pkg) {
@@ -205,20 +153,8 @@ class UsageStatsRepository(private val context: Context) {
         }
     }
 
-    private class MutableAppAccum(val pkg: String) {
-        var timeMs: Long = 0
-        var opens: Int = 0
-        var lateNightMs: Long = 0
-    }
-
     companion object {
-        /**
-         * Maximum credited length of a single uninterrupted foreground session.
-         * A dropped "stop"/screen-off event can otherwise leave a session open for
-         * hours (the old "Gojek 4h" phantom). Set to 2 hours so genuinely long
-         * continuous sessions (e.g. gaming) are not truncated, while still capping
-         * runaway sessions caused by missing events.
-         */
+        /** Cap on a single late-night session, guarding against a dropped stop event. */
         private const val MAX_SESSION_MS = 2 * 60 * 60 * 1000L
     }
 }
