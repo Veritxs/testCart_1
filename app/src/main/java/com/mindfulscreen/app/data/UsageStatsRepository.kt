@@ -14,7 +14,6 @@ import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
-import java.util.Calendar
 
 /**
  * Reads real per-app usage from Android's [UsageStatsManager].
@@ -67,9 +66,16 @@ class UsageStatsRepository(private val context: Context) {
         }
 
     /**
-     * Reconstructs per-app foreground time by replaying MOVE_TO_FOREGROUND /
-     * MOVE_TO_BACKGROUND events. More accurate than queryUsageStats aggregates,
-     * which can double-count across buckets.
+     * Reconstructs per-app foreground time by replaying usage events.
+     *
+     * Key correctness rules (fixing earlier over-counting):
+     *  - Only ONE app is in the foreground at a time. When a new app comes to the
+     *    foreground, the previously-foreground app's session is closed. We never rely
+     *    solely on per-app resume/pause pairing, because those events are frequently
+     *    dropped and leave sessions open for hours.
+     *  - We prefer the modern ACTIVITY_RESUMED/PAUSED events and ignore the legacy
+     *    MOVE_TO_FOREGROUND/BACKGROUND duplicates so a single session isn't double-opened.
+     *  - Any single session is capped (a dropped "stop" event can't inflate to hours).
      */
     private fun queryForegroundTime(
         start: Long,
@@ -79,29 +85,43 @@ class UsageStatsRepository(private val context: Context) {
         val result = HashMap<String, MutableAppAccum>()
         val events = usageStatsManager.queryEvents(start, end)
         val event = android.app.usage.UsageEvents.Event()
-        // Track the last foreground timestamp per package.
-        val foregroundSince = HashMap<String, Long>()
+
+        // The single app currently in the foreground, and since when.
+        var currentPkg: String? = null
+        var currentSince: Long = 0L
+
+        fun closeCurrent(at: Long) {
+            val pkg = currentPkg ?: return
+            accumulate(result, pkg, currentSince, at, zone)
+            currentPkg = null
+        }
 
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
             val pkg = event.packageName ?: continue
             when (event.eventType) {
-                android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND,
+                // App comes to the foreground: close whoever was there, open this one.
                 android.app.usage.UsageEvents.Event.ACTIVITY_RESUMED -> {
-                    foregroundSince[pkg] = event.timeStamp
-                    result.getOrPut(pkg) { MutableAppAccum(pkg) }.opens++
+                    if (pkg != currentPkg) {
+                        // Cap the outgoing session in case its stop event was dropped.
+                        closeCurrent(event.timeStamp)
+                        currentPkg = pkg
+                        currentSince = event.timeStamp
+                        result.getOrPut(pkg) { MutableAppAccum(pkg) }.opens++
+                    }
                 }
-                android.app.usage.UsageEvents.Event.MOVE_TO_BACKGROUND,
+                // This app left the foreground: close its session if it was the active one.
                 android.app.usage.UsageEvents.Event.ACTIVITY_PAUSED -> {
-                    val since = foregroundSince.remove(pkg) ?: continue
-                    accumulate(result, pkg, since, event.timeStamp, zone)
+                    if (pkg == currentPkg) closeCurrent(event.timeStamp)
+                }
+                // Screen turned off / became non-interactive: nothing is in the foreground.
+                android.app.usage.UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
+                    closeCurrent(event.timeStamp)
                 }
             }
         }
-        // Any app still in foreground at query end.
-        for ((pkg, since) in foregroundSince) {
-            accumulate(result, pkg, since, end, zone)
-        }
+        // Close whatever was still open (accumulate() caps runaway sessions).
+        currentPkg?.let { accumulate(result, it, currentSince, end, zone) }
         return result
     }
 
@@ -109,10 +129,12 @@ class UsageStatsRepository(private val context: Context) {
         map: MutableMap<String, MutableAppAccum>,
         pkg: String,
         from: Long,
-        to: Long,
+        rawTo: Long,
         zone: ZoneId,
     ) {
-        if (to <= from) return
+        if (rawTo <= from) return
+        // Guard against dropped "stop" events inflating a single session to hours.
+        val to = minOf(rawTo, from + MAX_SESSION_MS)
         val accum = map.getOrPut(pkg) { MutableAppAccum(pkg) }
         accum.timeMs += (to - from)
         accum.lateNightMs += lateNightOverlap(from, to, zone)
@@ -143,5 +165,15 @@ class UsageStatsRepository(private val context: Context) {
         var timeMs: Long = 0
         var opens: Int = 0
         var lateNightMs: Long = 0
+    }
+
+    companion object {
+        /**
+         * Maximum credited length of a single uninterrupted foreground session.
+         * A dropped "stop"/screen-off event can otherwise leave a session open for
+         * hours; capping it prevents phantom usage like "Gojek 4h" from a stray event.
+         * 30 minutes comfortably covers a normal continuous session.
+         */
+        private const val MAX_SESSION_MS = 30 * 60 * 1000L
     }
 }
