@@ -42,7 +42,15 @@ class UsageStatsRepository(private val context: Context) {
     fun usageAccessSettingsIntent(): Intent =
         Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
 
-    /** Aggregated usage for [date] (defaults to today), via event replay for accuracy. */
+    /**
+     * Aggregated usage for [date] (defaults to today).
+     *
+     * Per-app foreground time comes from Android's authoritative
+     * [UsageStatsManager.queryUsageStats] with INTERVAL_DAILY — the same source the
+     * system "Digital Wellbeing" screen uses, so our numbers match the phone's own.
+     * Event replay is used only for supplementary signals the aggregate can't give us:
+     * open counts and the late-night (00:00–06:00) portion.
+     */
     suspend fun getDayUsage(date: LocalDate = LocalDate.now()): DayUsage =
         withContext(Dispatchers.IO) {
             val zone = ZoneId.systemDefault()
@@ -51,19 +59,50 @@ class UsageStatsRepository(private val context: Context) {
             val now = System.currentTimeMillis()
             val end = minOf(endOfDay, now)
 
-            val perApp = queryForegroundTime(start, end, zone)
-            val total = perApp.values.sumOf { it.timeMs }
-            val lateNight = perApp.values.sumOf { it.lateNightMs }
+            // Authoritative per-app foreground time from the OS.
+            val foregroundByPkg = queryDailyForegroundMs(start, end)
+            // Supplementary signals (opens + late-night split) from event replay.
+            val replay = queryForegroundTime(start, end, zone)
+
+            val perApp = foregroundByPkg
+                .filter { (_, ms) -> ms > 0 }
+                .map { (pkg, ms) ->
+                    AppUsage(
+                        packageName = pkg,
+                        label = labelFor(pkg),
+                        timeMs = ms,
+                        opens = replay[pkg]?.opens ?: 0,
+                    )
+                }
+            val total = perApp.sumOf { it.timeMs }
+            val lateNight = replay.values.sumOf { it.lateNightMs }
 
             DayUsage(
                 dateEpochDay = date.toEpochDay(),
                 totalMs = total,
-                perApp = perApp.values
-                    .filter { it.timeMs > 0 }
-                    .map { AppUsage(it.pkg, labelFor(it.pkg), it.timeMs, it.opens) },
+                perApp = perApp,
                 lateNightMs = lateNight,
             )
         }
+
+    /**
+     * Per-app foreground milliseconds for [start,end] using the OS daily aggregates.
+     * Because INTERVAL_DAILY buckets can overlap the requested window, we take the max
+     * reported foreground time per package rather than summing (summing double-counts).
+     */
+    private fun queryDailyForegroundMs(start: Long, end: Long): Map<String, Long> {
+        val stats = usageStatsManager.queryUsageStats(
+            UsageStatsManager.INTERVAL_DAILY, start, end
+        ) ?: return emptyMap()
+        val result = HashMap<String, Long>()
+        for (s in stats) {
+            val fg = s.totalTimeInForeground
+            if (fg <= 0) continue
+            val prev = result[s.packageName] ?: 0L
+            if (fg > prev) result[s.packageName] = fg
+        }
+        return result
+    }
 
     /**
      * Reconstructs per-app foreground time by replaying usage events.
